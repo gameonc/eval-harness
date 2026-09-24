@@ -1,283 +1,167 @@
 #!/usr/bin/env python3
-"""
-LalanneShield evaluation harness.
-
-Purpose: produce the accuracy numbers you can publish. Right now you have a
-system that runs. This turns it into a system you can prove.
-
-WHAT YOU NEED
-  A CSV of carriers you have already seen, where you know how it turned out.
-  40-60 rows is enough to be meaningful. Include both good and bad carriers;
-  aim for at least 8-10 known-bad ones or the recall number means nothing.
-
-  labeled_carriers.csv
-    dot_number,mc_number,carrier_name,actual_outcome,notes
-    604653,,Example Trucking,legit,hauled 12 loads clean
-    ,1234567,Sketchy Freight LLC,fraud,double-brokered load in March
-
-  actual_outcome must be one of: legit | fraud
-  "fraud" = anything you would refuse today: double-brokering, identity
-  theft, fake authority, chameleon carrier, insurance lapse you got burned on.
-
-HOW TO PLUG IN YOUR SCORER
-  Edit score_carrier() below. Three options, pick one:
-    1. Call your n8n webhook (default, see USE_WEBHOOK)
-    2. Import your scoring function directly
-    3. Paste scores into a column and run in --precomputed mode
-
-RUN
-    python3 eval_harness.py labeled_carriers.csv
-    python3 eval_harness.py labeled_carriers.csv --threshold 0.6
-    python3 eval_harness.py labeled_carriers.csv --sweep
-
-OUTPUT
-    A confusion matrix, the four numbers that matter, and a block of text
-    formatted for the website. The number that sells is RECALL — of the bad
-    carriers, how many did it catch. The number that keeps you honest is the
-    FALSE NEGATIVE RATE — the ones it waved through.
-"""
-
+"""Evaluate binary risk scores. Offline by default; standard library only."""
 import argparse
 import csv
 import json
+import math
+import os
 import sys
-import time
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
 
-# ---------------------------------------------------------------------------
-# CONFIG - edit this block
-# ---------------------------------------------------------------------------
-
-USE_WEBHOOK = True
-WEBHOOK_URL = "https://YOUR-N8N-HOST/webhook/lalanneshield-score"
-WEBHOOK_TIMEOUT = 45          # seconds; FMCSA lookups are slow
-WEBHOOK_AUTH_HEADER = None    # e.g. {"Authorization": "Bearer ..."} - keep out of git
-
-# A carrier scoring at or above this is treated as "flag it".
 DEFAULT_THRESHOLD = 0.5
-
-# Seconds to wait between calls so you don't hammer FMCSA.
-POLITE_DELAY = 1.0
+MAX_RESPONSE = 65536
 
 
-def score_carrier(row):
-    """
-    Return a risk score between 0.0 (clearly fine) and 1.0 (clearly bad).
-
-    Return None if the carrier could not be scored at all (lookup failed,
-    no authority record found). Those rows are excluded from the metrics
-    and reported separately - a system that can't score 30% of carriers
-    has a coverage problem, and you want to know that.
-    """
-    if not USE_WEBHOOK:
-        raise NotImplementedError(
-            "Set USE_WEBHOOK = True and fill in WEBHOOK_URL, or import your "
-            "scoring function here and return a float."
-        )
-
-    payload = {
-        "dot_number": (row.get("dot_number") or "").strip(),
-        "mc_number": (row.get("mc_number") or "").strip(),
-        "carrier_name": (row.get("carrier_name") or "").strip(),
-        "source": "eval_harness",
-    }
-
-    req = urllib.request.Request(
-        WEBHOOK_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", **(WEBHOOK_AUTH_HEADER or {})},
-        method="POST",
-    )
-
+def probability(value):
+    if isinstance(value, bool):
+        raise ValueError('Scores must be finite numbers from 0 to 1.')
     try:
-        with urllib.request.urlopen(req, timeout=WEBHOOK_TIMEOUT) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
-        print(f"    ! scoring failed for {payload['carrier_name'] or payload['dot_number']}: {exc}",
-              file=sys.stderr)
+        score = float(value)
+    except (TypeError, ValueError):
+        raise ValueError('Scores must be finite numbers from 0 to 1.') from None
+    if not math.isfinite(score) or not 0 <= score <= 1:
+        raise ValueError('Scores must be finite numbers from 0 to 1.')
+    return score
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
-    # Adjust these key names to match what your workflow actually returns.
-    for key in ("risk_score", "score", "risk", "confidence"):
-        if key in body and body[key] is not None:
-            try:
-                return float(body[key])
-            except (TypeError, ValueError):
-                pass
 
-    # Fallback: a categorical verdict.
-    verdict = str(body.get("verdict", "")).lower()
-    mapping = {"high": 0.9, "flag": 0.9, "reject": 0.95,
-               "medium": 0.6, "review": 0.6,
-               "low": 0.1, "pass": 0.05, "clear": 0.05}
-    if verdict in mapping:
-        return mapping[verdict]
-
-    print(f"    ! no recognisable score in response: {body}", file=sys.stderr)
-    return None
+def validate_webhook(url):
+    parsed = urllib.parse.urlsplit(url)
+    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username
+            or parsed.password or parsed.query or parsed.fragment):
+        raise ValueError('Webhook must be an HTTPS URL without credentials, query, or fragment.')
+    return url
 
 
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
+def score_carrier(row, url):
+    """Only explicitly selected webhook mode sends identifiers to an operator URL."""
+    payload = {k: (row.get(k) or '').strip() for k in ('dot_number', 'mc_number', 'carrier_name')}
+    headers = {'Content-Type': 'application/json'}
+    token = os.environ.get('WEBHOOK_TOKEN', '')
+    if token:
+        headers['Authorization'] = 'Bearer ' + token
+    request = urllib.request.Request(validate_webhook(url), data=json.dumps(payload).encode(), headers=headers)
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=15) as response:
+            raw = response.read(MAX_RESPONSE + 1)
+        if len(raw) > MAX_RESPONSE:
+            return None
+        body = json.loads(raw)
+        return probability(body['risk_score']) if isinstance(body, dict) else None
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, TypeError):
+        # Never print response bodies, URLs, tokens, or carrier identifiers.
+        return None
 
-def evaluate(scored, threshold):
-    """scored = list of (label, score). Returns a metrics dict."""
+
+def evaluate(scored, threshold=DEFAULT_THRESHOLD):
+    threshold = probability(threshold)
     tp = fp = tn = fn = 0
     for label, score in scored:
-        flagged = score >= threshold
-        bad = label == "fraud"
-        if flagged and bad:
-            tp += 1
-        elif flagged and not bad:
-            fp += 1
-        elif not flagged and bad:
-            fn += 1
+        if label not in ('fraud', 'legit'):
+            raise ValueError('Labels must be fraud or legit.')
+        flagged = probability(score) >= threshold
+        if label == 'fraud':
+            tp += int(flagged)
+            fn += int(not flagged)
         else:
-            tn += 1
-
-    total = tp + fp + tn + fn
-    n_bad = tp + fn
-    n_good = tn + fp
-
-    def pct(num, den):
-        return (100.0 * num / den) if den else float("nan")
-
-    return {
-        "threshold": threshold,
-        "total": total,
-        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
-        "accuracy": pct(tp + tn, total),
-        "recall": pct(tp, n_bad),                 # of the bad ones, how many caught
-        "precision": pct(tp, tp + fp),            # of the flags, how many were real
-        "false_negative_rate": pct(fn, n_bad),    # the one that costs money
-        "false_positive_rate": pct(fp, n_good),   # the one that annoys dispatch
-        "n_bad": n_bad,
-        "n_good": n_good,
-    }
+            fp += int(flagged)
+            tn += int(not flagged)
+    total, bad, good = tp + fp + tn + fn, tp + fn, tn + fp
+    def pct(n, d):
+        return 100.0 * n / d if d else None
+    return dict(threshold=threshold, total=total, tp=tp, fp=fp, tn=tn, fn=fn,
+                n_bad=bad, n_good=good, accuracy=pct(tp + tn, total), recall=pct(tp, bad),
+                precision=pct(tp, tp + fp), false_negative_rate=pct(fn, bad),
+                false_positive_rate=pct(fp, good))
 
 
-def print_report(m, unscorable, source_file):
-    w = 62
-    print()
-    print("=" * w)
-    print("  LALANNESHIELD - EVALUATION REPORT")
-    print("=" * w)
-    print(f"  source            {source_file}")
-    print(f"  carriers scored   {m['total']}  ({m['n_bad']} known bad, {m['n_good']} known good)")
-    if unscorable:
-        print(f"  unscorable        {unscorable}  (excluded - see coverage note below)")
-    print(f"  flag threshold    {m['threshold']:.2f}")
-    print("-" * w)
-    print("  CONFUSION MATRIX")
-    print()
-    print("                     predicted BAD   predicted OK")
-    print(f"    actually BAD  {m['tp']:>12}   {m['fn']:>12}   <- misses cost money")
-    print(f"    actually OK   {m['fp']:>12}   {m['tn']:>12}")
-    print("-" * w)
-    print("  HEADLINE NUMBERS")
-    print()
-    print(f"    Accuracy               {m['accuracy']:.1f}%")
-    print(f"    Recall (caught)        {m['recall']:.1f}%   <- the number that sells")
-    print(f"    Precision (of flags)   {m['precision']:.1f}%")
-    print(f"    False negative rate    {m['false_negative_rate']:.1f}%   <- the number that keeps you honest")
-    print(f"    False positive rate    {m['false_positive_rate']:.1f}%")
-    print("=" * w)
-
-    print()
-    print("  ---- PASTE INTO THE WEBSITE ----")
-    print()
-    print(f"  Evaluated against {m['total']} historical carriers with known outcomes:")
-    print(f"  {m['accuracy']:.0f}% accuracy, {m['false_negative_rate']:.0f}% false-negative rate.")
-    print()
-    if m["n_bad"] < 8:
-        print("  ! WARNING: fewer than 8 known-bad carriers. Recall and false-negative")
-        print("    rate are not yet trustworthy. Add more bad examples before publishing.")
-    if unscorable:
-        cov = 100.0 * m["total"] / (m["total"] + unscorable)
-        print(f"  ! COVERAGE: only {cov:.0f}% of carriers could be scored at all.")
-        print("    Publish this honestly or fix the lookup gap first. A buyer will ask.")
-    print()
+def read_rows(path, limit=0, webhook=False):
+    with open(path, newline='', encoding='utf-8-sig') as stream:
+        reader = csv.DictReader(stream)
+        fields = reader.fieldnames or []
+        required = {'actual_outcome'} | (set() if webhook else {'risk_score'})
+        if len(fields) != len(set(fields)) or not required.issubset(fields):
+            raise ValueError('CSV needs unique headers including actual_outcome and, offline, risk_score.')
+        rows = list(reader)
+    if limit:
+        rows = rows[:limit]
+    for index, row in enumerate(rows, 2):
+        if None in row or any(v is None for v in row.values()):
+            raise ValueError(f'CSV row {index} has the wrong number of columns.')
+        row['actual_outcome'] = row['actual_outcome'].strip().lower()
+        if row['actual_outcome'] not in ('fraud', 'legit'):
+            raise ValueError(f'CSV row {index} has an invalid label.')
+        if not webhook and row['risk_score'].strip():
+            try:
+                probability(row['risk_score'])
+            except ValueError:
+                raise ValueError(f'CSV row {index} has an invalid risk_score.') from None
+    return rows
 
 
-def sweep(scored):
-    print()
-    print("  THRESHOLD SWEEP - pick the operating point you actually want")
-    print()
-    print("   thresh   recall   precision   false-neg   false-pos")
-    print("   " + "-" * 50)
-    best = None
-    for i in range(1, 20):
-        t = i / 20.0
-        m = evaluate(scored, t)
-        print(f"    {t:.2f}    {m['recall']:6.1f}%   {m['precision']:7.1f}%   "
-              f"{m['false_negative_rate']:8.1f}%   {m['false_positive_rate']:8.1f}%")
-        # Favour catching fraud: weight recall 2x precision.
-        if m["recall"] == m["recall"] and m["precision"] == m["precision"]:
-            score = 2 * m["recall"] + m["precision"]
-            if best is None or score > best[1]:
-                best = (t, score)
-    if best:
-        print()
-        print(f"   Suggested threshold: {best[0]:.2f}  (weights catching fraud 2:1 over")
-        print("   avoiding false alarms - which is the right trade for a broker)")
-    print()
-
-
-def main():
-    ap = argparse.ArgumentParser(description="Evaluate LalanneShield against known outcomes.")
-    ap.add_argument("csv_file", help="labeled carriers CSV")
-    ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
-    ap.add_argument("--sweep", action="store_true", help="try every threshold")
-    ap.add_argument("--precomputed", action="store_true",
-                    help="read a 'risk_score' column instead of calling the scorer")
-    ap.add_argument("--limit", type=int, default=0, help="only score the first N rows")
-    args = ap.parse_args()
-
-    with open(args.csv_file, newline="", encoding="utf-8") as fh:
-        rows = list(csv.DictReader(fh))
-
-    if args.limit:
-        rows = rows[:args.limit]
-
-    valid_labels = {"legit", "fraud"}
+def run(rows, threshold, webhook=None, do_sweep=False):
     scored = []
     unscorable = 0
-
-    print(f"\nScoring {len(rows)} carriers...")
-    for i, row in enumerate(rows, 1):
-        label = (row.get("actual_outcome") or "").strip().lower()
-        if label not in valid_labels:
-            print(f"  row {i}: skipping, actual_outcome must be legit|fraud (got '{label}')",
-                  file=sys.stderr)
-            continue
-
-        if args.precomputed:
-            raw = (row.get("risk_score") or "").strip()
-            score = float(raw) if raw else None
-        else:
-            score = score_carrier(row)
-            time.sleep(POLITE_DELAY)
-
+    for row in rows:
+        raw = row.get('risk_score', '').strip()
+        score = score_carrier(row, webhook) if webhook else (probability(raw) if raw else None)
         if score is None:
             unscorable += 1
-            continue
+        else:
+            scored.append((row['actual_outcome'], score))
+    report = evaluate(scored, threshold)
+    report.update(input_rows=len(rows), unscorable=unscorable,
+                  coverage=100 * len(scored) / len(rows) if rows else 0,
+                  mode='webhook' if webhook else 'precomputed', warnings=[])
+    if report['n_bad'] < 8 or report['n_good'] < 8:
+        report['warnings'].append('Small or single-class sample: descriptive metrics only; not evidence of generalization.')
+    if unscorable:
+        report['warnings'].append('Metrics exclude unscorable rows. Report coverage alongside all metrics.')
+    report['warnings'].append('Data provenance is not verified. Synthetic results are not production accuracy.')
+    if do_sweep:
+        report['threshold_sweep'] = [evaluate(scored, i / 20) for i in range(1, 20)]
+        report['warnings'].append('Threshold exploration uses this same dataset. Validate choices on a separate held-out set.')
+    return report
 
-        scored.append((label, score))
-        name = (row.get("carrier_name") or row.get("dot_number") or "?")[:34]
-        print(f"  [{i:>3}/{len(rows)}] {name:<34} {score:.2f}  ({label})")
 
-    if not scored:
-        print("\nNothing scored. Check the scorer config and your CSV.", file=sys.stderr)
-        return 1
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('csv_file')
+    parser.add_argument('--threshold', type=probability, default=DEFAULT_THRESHOLD)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--precomputed', action='store_true', help='offline mode (default)')
+    modes.add_argument('--webhook', type=validate_webhook, help='explicitly send row identifiers to this HTTPS scorer')
+    parser.add_argument('--sweep', action='store_true')
+    parser.add_argument('--json', action='store_true', help='machine-readable report; undefined metrics are null')
+    parser.add_argument('--limit', type=int, default=0)
+    args = parser.parse_args(argv)
+    if args.limit < 0:
+        parser.error('--limit must be nonnegative')
+    try:
+        rows = read_rows(args.csv_file, args.limit, bool(args.webhook))
+        report = run(rows, args.threshold, args.webhook, args.sweep)
+    except (ValueError, OSError, csv.Error, UnicodeError) as exc:
+        print(f'Input error: {exc.__class__.__name__}. Check the file, headers, labels and finite scores in [0, 1].', file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report, indent=2, allow_nan=False))
+    else:
+        print('Risk-score evaluation — descriptive results')
+        for key in ('input_rows', 'total', 'unscorable', 'coverage', 'tp', 'fp', 'tn', 'fn', 'accuracy', 'recall', 'precision', 'false_negative_rate', 'false_positive_rate'):
+            print(f'{key}: {report[key] if report[key] is not None else "undefined"}')
+        for warning in report['warnings']:
+            print('Note: ' + warning)
+        if args.sweep:
+            for item in report['threshold_sweep']:
+                print(f'Threshold {item["threshold"]:.2f}: recall={item["recall"]}, precision={item["precision"]}')
+    return 0 if report['total'] else 1
 
-    if args.sweep:
-        sweep(scored)
 
-    print_report(evaluate(scored, args.threshold), unscorable, args.csv_file)
-    return 0
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())
