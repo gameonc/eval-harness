@@ -1,74 +1,37 @@
-# Eval harness
+# Risk-score evaluation harness
 
-**A small script for turning "the system runs" into "the system is measured."**
+A dependency-free Python CLI by **Cady Lalanne** for checking binary classifiers. Reports confusion matrices, coverage, precision, recall, and error rates. Invalid labels and non-finite/out-of-range scores fail validation instead of silently distorting results.
 
-If you have built a classifier that scores something — carriers, leads, tickets,
-claims — you will eventually be asked how well it works. This produces the answer
-in a form you can publish, and refuses to produce one when your labeled set is too
-small to mean anything.
+## Try it in one minute
 
-Written for carrier fraud screening in freight brokerage, but the scorer is a
-single function you replace. Nothing else is domain-specific.
+Python 3.10+; no account, API key, installation, or network needed:
 
-## What you need
-
-A CSV of cases you have already seen, where you know how it turned out. 40–60 rows
-is enough to be meaningful. Include both good and bad outcomes; aim for at least
-8–10 known-bad ones or the recall number means nothing.
-
-```csv
-dot_number,mc_number,carrier_name,actual_outcome,notes
-604653,,Example Trucking,legit,hauled 12 loads clean
-,1234567,Sketchy Freight LLC,fraud,double-brokered a load in March
+```sh
+python3 eval_harness.py examples/synthetic.csv --json
+python3 eval_harness.py examples/synthetic.csv --sweep
+python3 -m unittest discover -s tests -v
 ```
 
-`actual_outcome` must be `legit` or `fraud`.
+The 20 included rows are **synthetic**, with intentionally imperfect predictions. They exercise the software; they do not establish real-world fraud detection accuracy.
 
-## Plugging in your scorer
+## Your dataset
 
-Edit `score_carrier()`. Three options:
+Required CSV columns: `actual_outcome` (`fraud` or `legit`) and `risk_score` (finite 0–1). A blank score is unscorable and reduces coverage. Invalid labels/scores, duplicate headers, missing columns, and malformed rows stop the run. Extra named columns are allowed. Keep customer data outside this repository.
 
-1. Call your webhook (default — set `WEBHOOK_URL`)
-2. Import your scoring function directly
-3. Precompute scores into a `risk_score` column and run `--precomputed`
-
-Return a float from 0.0 to 1.0, or `None` if the case could not be scored at all.
-Unscorable rows are excluded from the metrics and reported separately — a system
-that cannot score 30% of its inputs has a coverage problem, and you want that
-number in front of you rather than averaged away.
-
-## Running it
-
-```bash
-python3 eval_harness.py labeled_carriers.csv
-python3 eval_harness.py labeled_carriers.csv --threshold 0.6
-python3 eval_harness.py labeled_carriers.csv --sweep
+```sh
+python3 eval_harness.py /path/to/private.csv --threshold 0.6 --json
 ```
 
-No dependencies beyond the standard library.
+Undefined metrics are JSON `null`. Exit codes: `0` at least one scored row, `1` none scored, `2` invalid input/configuration. `--precomputed` remains an explicit alias for default offline mode.
 
-## What it tells you
+## Optional webhook
 
-A confusion matrix and five numbers: accuracy, recall, precision, false-negative
-rate, false-positive rate.
+Only `--webhook https://your-owned-scorer.example/score` enables network scoring. It sends `dot_number`, `mc_number`, and `carrier_name`; notes are excluded. Use a trusted endpoint and data you are authorized to send. HTTPS is required and redirects are rejected. The optional `WEBHOOK_TOKEN` environment variable supplies bearer authentication; never put credentials in source or URLs.
 
-**Recall** is the number that sells — of the bad ones, how many did it catch.
-**False-negative rate** is the number that keeps you honest — the ones it waved
-through.
+Responses must be JSON objects with `risk_score` in [0, 1]. Timeouts, oversized responses, malformed JSON/scores, and HTTP failures become unscorable rows. One attempt per row; no automatic retries. Integration tests use mocks, not a production scorer.
 
-`--sweep` walks every threshold and suggests an operating point, weighting recall
-2:1 over precision, which is the right trade when a miss costs money and a false
-alarm costs a phone call.
+## Interpretation and limits
 
-Two guardrails it will not let you skip:
+Metrics describe the scored subset: always show coverage. Small/single-class samples get warnings, not statistical guarantees. No fixed sample count establishes representativeness. Threshold sweeps explore the same data: choose business costs explicitly and validate on a separate held-out set. The CLI does not verify labels or provenance or generate marketing claims.
 
-- Fewer than 8 known-bad cases and it refuses to treat recall as trustworthy
-- Low scoring coverage and it tells you the coverage percentage, because a buyer
-  will ask
-
-## Why
-
-Most AI pilots die at the question "how do you know it works." This is the
-cheapest possible answer to that question.
-
-MIT licensed. Take it, use it, tell me what breaks.
+A local evaluation utility, not a trained model or production screening service. Read [SECURITY.md](SECURITY.md). MIT licensed.

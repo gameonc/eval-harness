@@ -1,0 +1,21 @@
+carrier_name,actual_outcome,risk_score
+Fictional 0,fraud,0.9
+Fictional 1,fraud,0.9
+Fictional 2,fraud,0.9
+Fictional 3,fraud,0.9
+Fictional 4,fraud,0.9
+Fictional 5,fraud,0.9
+Fictional 6,fraud,0.9
+Fictional 7,fraud,0.9
+Fictional 8,fraud,0.2
+Fictional 9,fraud,0.2
+Fictional 10,legit,0.8
+Fictional 11,legit,0.8
+Fictional 12,legit,0.1
+Fictional 13,legit,0.1
+Fictional 14,legit,0.1
+Fictional 15,legit,0.1
+Fictional 16,legit,0.1
+Fictional 17,legit,0.1
+Fictional 18,legit,0.1
+Fictional 19,legit,0.1
