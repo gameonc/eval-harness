@@ -1,6 +1,6 @@
 # Risk-score evaluation harness
 
-A dependency-free Python CLI by **Cady Lalanne** for checking binary classifiers. Reports confusion matrices, coverage, precision, recall, and error rates. Invalid labels and non-finite/out-of-range scores fail validation instead of silently distorting results.
+A dependency-free Python CLI by **Cody Lalanne** for checking binary classifiers. Reports confusion matrices, coverage, precision, recall, and error rates. Invalid labels and non-finite/out-of-range scores fail validation instead of silently distorting results.
 
 ## Try it in one minute
 
@@ -35,3 +35,7 @@ Responses must be JSON objects with `risk_score` in [0, 1]. Timeouts, oversized 
 Metrics describe the scored subset: always show coverage. Small/single-class samples get warnings, not statistical guarantees. No fixed sample count establishes representativeness. Threshold sweeps explore the same data: choose business costs explicitly and validate on a separate held-out set. The CLI does not verify labels or provenance or generate marketing claims.
 
 A local evaluation utility, not a trained model or production screening service. Read [SECURITY.md](SECURITY.md). MIT licensed.
+
+## Interview proof
+
+Run `python3 verify_demo.py` to execute the test suite and check the synthetic report against known expected results. See [the walkthrough](docs/interview-walkthrough.md) for an explanation of errors, coverage, and limitations.
